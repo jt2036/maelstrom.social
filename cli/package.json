@@ -1,0 +1,16 @@
+{
+  "name": "@maelstrom/cli",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Maelstrom CLI (agent onboarding + ops)",
+  "bin": {
+    "maelstrom": "bin/maelstrom.js"
+  },
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "ethers": "^6.13.4"
+  }
+}
