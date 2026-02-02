@@ -4,18 +4,18 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { Wallet, JsonRpcProvider, formatEther } = require('ethers');
+const { Wallet, JsonRpcProvider, formatEther, Contract, AbiCoder, getBytes, hexlify } = require('ethers');
 
 function usage(exitCode = 0) {
   const msg = `maelstrom (prototype)
 
 Usage:
   maelstrom fc init [--name <agentName>] [--force]
-  maelstrom fc register [--name <agentName>] [--secrets <path>] [--rpc <url>] [--no-signer]
+  maelstrom fc register [--name <agentName>] [--secrets <path>] [--rpc <url>] [--id-gateway <addr>] [--key-gateway <addr>] [--no-signer]
 
 Commands:
   fc init    Generate custody + recovery keys for a Farcaster agent and store locally.
-  fc register  (WIP) Check Optimism connectivity + balance and print the onchain tx steps to register a new FID + signer.
+  fc register  Register a new Farcaster FID + add an ed25519 signer key (on OP Mainnet).
 
 Notes:
   - This command NEVER prints private keys.
@@ -35,6 +35,8 @@ function parseArgs(argv) {
     else if (a === '--rpc') args.rpc = argv[++i];
     else if (a === '--force') args.force = true;
     else if (a === '--no-signer') args.noSigner = true;
+    else if (a === '--id-gateway') args.idGateway = argv[++i];
+    else if (a === '--key-gateway') args.keyGateway = argv[++i];
     else args._.push(a);
   }
   return args;
@@ -113,6 +115,13 @@ function generateEd25519Signer() {
     privateKeyBase64url,
     createdAt: new Date().toISOString()
   };
+}
+
+function base64urlToBytes(s) {
+  if (typeof s !== 'string' || !s) throw new Error('Invalid base64url');
+  let b64 = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (b64.length % 4) b64 += '=';
+  return Uint8Array.from(Buffer.from(b64, 'base64'));
 }
 
 function getOptimismRpcUrl(args) {
@@ -200,7 +209,7 @@ async function main() {
       }
     }
 
-    process.stdout.write(`Farcaster onchain registration (WIP)\n\n`);
+    process.stdout.write(`Farcaster onchain registration\n\n`);
     process.stdout.write(`Secrets file: ${secretsPath}\n`);
     process.stdout.write(`OP RPC: ${rpcUrl}\n`);
 
@@ -221,38 +230,126 @@ async function main() {
     const bal = await provider.getBalance(custody.address);
     process.stdout.write(`Custody balance:  ${formatEther(bal)} ETH\n\n`);
 
-    if (bal === 0n) {
-      process.stdout.write(
-        `Warning: custody address has 0 ETH on Optimism; you must fund it before you can register an FID.\n\n`
-      );
-    }
+    // Defaults from farcasterxyz/contracts README (v3.1 OP Mainnet deployments)
+    const DEFAULT_ID_GATEWAY = '0x00000000fc25870c6ed6b6c7e41fb078b7656f69';
+    const DEFAULT_KEY_GATEWAY = '0x00000000fc56947c7e7183f8ca4b62398caadf0b';
 
-    if (!args.noSigner) {
-      if (payload.appSignerPublicKeyBase64url) {
-        process.stdout.write(`App signer key:   ed25519 (stored in secrets file)\n`);
+    const idGatewayAddress = (args.idGateway || process.env.FC_ID_GATEWAY || DEFAULT_ID_GATEWAY).trim();
+    const keyGatewayAddress = (args.keyGateway || process.env.FC_KEY_GATEWAY || DEFAULT_KEY_GATEWAY).trim();
+
+    const idGatewayAbi = [
+      'function idRegistry() view returns (address)',
+      'function price(uint256 extraStorage) view returns (uint256)',
+      'function register(address recovery) payable returns (uint256 fid, uint256 overpayment)'
+    ];
+
+    const idRegistryAbi = ['function idOf(address owner) view returns (uint256)'];
+
+    const idGateway = new Contract(idGatewayAddress, idGatewayAbi, custody);
+    const idRegistryAddress = await idGateway.idRegistry();
+    const idRegistry = new Contract(idRegistryAddress, idRegistryAbi, provider);
+
+    // Step 1: Register fid if needed
+    let fid = await idRegistry.idOf(custody.address);
+    if (fid === 0n) {
+      const price = await idGateway.price(0);
+      if (bal < price) {
+        throw new Error(
+          `Insufficient ETH for registration. Need at least ${formatEther(price)} ETH on Optimism to rent 1 storage unit.`
+        );
       }
+
+      process.stdout.write(`1) Registering a new FID via IdGateway...\n`);
+      const tx = await idGateway['register(address)'](recovery.address, { value: price });
+      process.stdout.write(`   tx: ${tx.hash}\n`);
+      await tx.wait(2);
+
+      fid = await idRegistry.idOf(custody.address);
+      if (fid === 0n) throw new Error('FID registration tx mined but idOf(custody) is still 0');
+
+      payload.fid = fid.toString();
+      payload.fidRegisteredAt = new Date().toISOString();
+      overwriteSecretsFile(secretsPath, payload);
+
+      process.stdout.write(`   FID: ${fid.toString()}\n\n`);
     } else {
-      process.stdout.write(`App signer key:   (skipped; --no-signer)\n`);
+      process.stdout.write(`1) FID already exists for custody address: ${fid.toString()}\n\n`);
     }
 
-    process.stdout.write(`\nNext required Optimism transactions (TODO: implement in CLI):\n`);
-    process.stdout.write(
-      `  1) Register a new Farcaster identity (FID)\n` +
-        `     - From: custody address\n` +
-        `     - Inputs: recovery address\n` +
-        `     - Effect: assigns a new FID to the custody address onchain\n`
+    // Step 2: Add signer (ed25519) via KeyGateway
+    if (args.noSigner) {
+      process.stdout.write(`2) Skipping signer registration (--no-signer)\n`);
+      return;
+    }
+
+    if (!keyGatewayAddress) {
+      throw new Error(`Missing KeyGateway address. Provide --key-gateway <addr> or set FC_KEY_GATEWAY in env.`);
+    }
+
+    const keyGatewayAbi = [
+      'function keyRegistry() view returns (address)',
+      'function add(uint32 keyType, bytes key, uint8 metadataType, bytes metadata)'
+    ];
+    const keyRegistryAbi = [
+      'function validators(uint32 keyType, uint8 metadataType) view returns (address)'
+    ];
+
+    const keyGateway = new Contract(keyGatewayAddress, keyGatewayAbi, custody);
+    const keyRegistryAddress = await keyGateway.keyRegistry();
+    const keyRegistry = new Contract(keyRegistryAddress, keyRegistryAbi, provider);
+    const validatorAddress = await keyRegistry.validators(1, 1);
+
+    if (!validatorAddress || validatorAddress === '0x0000000000000000000000000000000000000000') {
+      throw new Error('Could not resolve SignedKeyRequestValidator address from KeyRegistry.validators(1,1)');
+    }
+
+    const pub = base64urlToBytes(payload.appSignerPublicKeyBase64url);
+    if (pub.length !== 32) throw new Error(`App signer public key must be 32 bytes (got ${pub.length})`);
+
+    const keyBytes = pub;
+
+    const deadline = BigInt(Math.floor(Date.now() / 1000) + 60 * 60); // 1 hour
+
+    // SignedKeyRequest (EIP-712) signature by custody address
+    const domain = {
+      name: 'Farcaster SignedKeyRequestValidator',
+      version: '1',
+      chainId: Number(chainId),
+      verifyingContract: validatorAddress
+    };
+
+    const types = {
+      SignedKeyRequest: [
+        { name: 'requestFid', type: 'uint256' },
+        { name: 'key', type: 'bytes' },
+        { name: 'deadline', type: 'uint256' }
+      ]
+    };
+
+    const value = {
+      requestFid: fid,
+      key: hexlify(keyBytes),
+      deadline
+    };
+
+    const signature = await custody.signTypedData(domain, types, value);
+
+    // IMPORTANT: metadata must be ABI-encoded as a single SignedKeyRequestMetadata tuple (matches validator.encodeMetadata),
+    // not as four top-level values.
+    const metadata = AbiCoder.defaultAbiCoder().encode(
+      ['tuple(uint256 requestFid,address requestSigner,bytes signature,uint256 deadline)'],
+      [{ requestFid: fid, requestSigner: custody.address, signature, deadline }]
     );
-    process.stdout.write(
-      `  2) Add the app signer key to Farcaster (so the agent can post without custody key)\n` +
-        `     - From: custody address\n` +
-        `     - Inputs: app signer public key (ed25519)\n` +
-        `     - Effect: authorizes the signer in Farcaster's Key Registry onchain\n`
-    );
-    process.stdout.write(
-      `\nNotes:\n` +
-        `  - Contract addresses/ABIs and exact function calls are intentionally TODO'd here.\n` +
-        `  - Once implemented, this command should submit txs and print tx hashes + resulting FID.\n`
-    );
+
+    process.stdout.write(`2) Adding signer via KeyGateway...\n`);
+    const addTx = await keyGateway.add(1, keyBytes, 1, metadata);
+    process.stdout.write(`   tx: ${addTx.hash}\n`);
+    await addTx.wait(2);
+
+    payload.appSignerAddedAt = new Date().toISOString();
+    overwriteSecretsFile(secretsPath, payload);
+
+    process.stdout.write(`\nDone. FID ${fid.toString()} is registered and signer is added onchain.\n`);
     return;
   }
 
