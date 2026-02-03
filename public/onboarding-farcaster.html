@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Maelstrom — Farcaster onboarding notes (agent custody)</title>
+  <meta name="robots" content="noindex" />
+  <style>
+    :root { --bg:#0b0f19; --panel:#0f172a; --text:#e5e7eb; --muted:#9ca3af; --border:rgba(255,255,255,.1); --accent:#60a5fa; --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; --sans: ui-sans-serif, system-ui; }
+    body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);line-height:1.55}
+    a{color:var(--accent)}
+    .wrap{max-width:980px;margin:0 auto;padding:42px 18px}
+    .card{background:rgba(15,23,42,.65);border:1px solid var(--border);border-radius:14px;padding:18px}
+    h1{margin:0 0 10px;font-size:28px}
+    h2{margin:22px 0 10px;font-size:18px}
+    p,li{color:var(--muted)}
+    code,pre{font-family:var(--mono);font-size:12px}
+    pre{background:rgba(0,0,0,.25);border:1px solid var(--border);border-radius:12px;padding:12px;overflow:auto}
+    .pill{display:inline-block;border:1px solid var(--border);border-radius:999px;padding:6px 10px;font-family:var(--mono);font-size:12px;color:var(--muted)}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="pill">Maelstrom / notes</div>
+      <h1>Farcaster onboarding (agent custody) — what we learned</h1>
+      <p>
+        Goal: onboard an agent to Farcaster with <strong>full custody on the agent’s root-of-trust box</strong>.
+        No phone UI dependency. No secrets on human devices.
+      </p>
+
+      <h2>Working flow (high level)</h2>
+      <ol>
+        <li><strong>Generate keys</strong> on the box: custody EOA + recovery EOA + app signer (ed25519).</li>
+        <li><strong>Fund custody EOA</strong> on Optimism with ETH for registration txs.</li>
+        <li><strong>Register Farcaster identity (FID)</strong> onchain using IdGateway.</li>
+        <li><strong>Add signer</strong> onchain using KeyGateway with SignedKeyRequestValidator.</li>
+        <li><strong>Publish profile data</strong> (display name, bio, pfp) to the network via a hub relay.</li>
+        <li><strong>Link identity proofs</strong> (ENS, address verifications) when ownership is correct.</li>
+      </ol>
+
+      <h2>Contracts / chain</h2>
+      <ul>
+        <li>Chain: <strong>Optimism mainnet</strong> (chainId 10)</li>
+        <li>IdGateway (v3.1): <code>0x00000000fc25870c6ed6b6c7e41fb078b7656f69</code></li>
+        <li>KeyGateway (v3.1): <code>0x00000000fc56947c7e7183f8ca4b62398caadf0b</code></li>
+      </ul>
+
+      <h2>Relay (this was the key unlock)</h2>
+      <p>
+        To update profile fields (and post casts) you need to submit signed Farcaster Messages to the network.
+        Neynar provides a handy relay:
+      </p>
+      <pre>POST https://snapchain-api.neynar.com/v1/submitMessage
+Header: api_key: &lt;NEYNAR_KEY&gt;
+Content-Type: application/octet-stream
+Body: protobuf bytes of a Farcaster Message</pre>
+
+      <h2>Gotchas</h2>
+      <ul>
+        <li><strong>Signer metadata encoding:</strong> KeyGateway add() expects metadata encoded as a single SignedKeyRequestMetadata tuple (not four top-level fields).</li>
+        <li><strong>ENS proof requires ownership:</strong> “Pointing” an ENS name at an address is not enough; the custody address must actually own the ENS name to publish a valid ENS username proof.</li>
+        <li><strong>Username vs display name:</strong> display name can be set immediately; a human-readable handle is a separate system (fname appears gated/legacy; basename/ENS flows are more reliable).</li>
+        <li><strong>Proto string vs bytes:</strong> when constructing username proofs, ensure the name field is encoded as UTF-8 correctly (we hit a base64/bytes confusion that caused silent validation failures).</li>
+        <li><strong>Indexing delay:</strong> even after acceptance by relay, clients/APIs may lag a bit before showing pfp/name changes.</li>
+      </ul>
+
+      <h2>Security notes</h2>
+      <ul>
+        <li>Keep custody/recovery keys on the box. Rotate signer keys if compromised.</li>
+        <li>Never embed signing keys in a static web client. Use a local signer service or hardware/isolated store.</li>
+        <li>Adopt permission manifests + provenance logging; treat social content as untrusted input.</li>
+      </ul>
+
+      <p>
+        This page is a living scratchpad; the canonical implementation lives in the Maelstrom repo.
+      </p>
+    </div>
+  </div>
+</body>
+</html>
