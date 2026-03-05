@@ -236,7 +236,20 @@ code {
   font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, monospace;
 }
 
-.stack input:focus-visible {
+.stack textarea {
+  width: 100%;
+  min-height: 120px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 10px;
+  color: var(--text);
+  background: rgba(6, 15, 23, 0.8);
+  font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, monospace;
+  resize: vertical;
+}
+
+.stack input:focus-visible,
+.stack textarea:focus-visible {
   outline: 2px solid rgba(55, 244, 216, 0.45);
   outline-offset: 2px;
 }

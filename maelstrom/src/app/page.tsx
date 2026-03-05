@@ -21,7 +21,12 @@ const idGatewayAbi = [
   "function register(address recovery) payable returns (uint256 fid, uint256 overpayment)",
 ] as const;
 
-const idRegistryAbi = ["function idOf(address owner) view returns (uint256)"] as const;
+const idRegistryAbi = [
+  "function idOf(address owner) view returns (uint256)",
+  "function custodyOf(uint256 fid) view returns (address)",
+  "function recoveryOf(uint256 fid) view returns (address)",
+  "function changeRecoveryAddress(address recovery)",
+] as const;
 
 type ActivityLevel = "info" | "success" | "error";
 type Activity = {
@@ -31,7 +36,18 @@ type Activity = {
   level: ActivityLevel;
 };
 
-type BusyAction = "generate" | "refresh" | "register" | "copy" | "download" | "copyAddress" | "copyProfile" | null;
+type BusyAction =
+  | "generate"
+  | "import"
+  | "refresh"
+  | "register"
+  | "setRecovery"
+  | "copy"
+  | "download"
+  | "copyAddress"
+  | "copyProfile"
+  | null;
+type SecretKind = "none" | "mnemonic" | "privateKey";
 
 function formatEth(wei: bigint | null): string {
   if (wei === null) return "-";
@@ -66,8 +82,68 @@ function toHttpUrl(value: string): string {
   }
 }
 
+function parseCustodySecret(raw: string): { privateKey: string; mnemonic: string; kind: SecretKind } {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    throw new Error("Paste a seed phrase, private key, or backup JSON.");
+  }
+
+  if (trimmed.startsWith("{")) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      throw new Error("Invalid JSON payload.");
+    }
+
+    if (parsed && typeof parsed === "object") {
+      const maybeSeedPhrase = (parsed as { seedPhrase?: unknown }).seedPhrase;
+      if (typeof maybeSeedPhrase === "string" && maybeSeedPhrase.trim()) {
+        return parseCustodySecret(maybeSeedPhrase);
+      }
+
+      const maybeCustodyPrivateKey = (parsed as { custodyPrivateKey?: unknown }).custodyPrivateKey;
+      if (typeof maybeCustodyPrivateKey === "string" && maybeCustodyPrivateKey.trim()) {
+        return parseCustodySecret(maybeCustodyPrivateKey);
+      }
+
+      const maybePrivateKey = (parsed as { privateKey?: unknown }).privateKey;
+      if (typeof maybePrivateKey === "string" && maybePrivateKey.trim()) {
+        return parseCustodySecret(maybePrivateKey);
+      }
+    }
+
+    throw new Error("JSON does not contain seedPhrase or private key fields.");
+  }
+
+  const normalizedWhitespace = trimmed.replace(/\s+/g, " ").trim();
+  if (normalizedWhitespace.split(" ").length >= 12) {
+    const wallet = ethers.HDNodeWallet.fromPhrase(normalizedWhitespace);
+    return {
+      privateKey: wallet.privateKey,
+      mnemonic: normalizedWhitespace,
+      kind: "mnemonic",
+    };
+  }
+
+  if (/^(0x)?[0-9a-fA-F]{64}$/.test(trimmed)) {
+    const normalizedKey = trimmed.startsWith("0x") ? trimmed : `0x${trimmed}`;
+    const wallet = new ethers.Wallet(normalizedKey);
+    return {
+      privateKey: wallet.privateKey,
+      mnemonic: "",
+      kind: "privateKey",
+    };
+  }
+
+  throw new Error("Unrecognized key format. Use a 12/24-word phrase, 32-byte private key, or backup JSON.");
+}
+
 export default function Home() {
+  const [importSecretInput, setImportSecretInput] = useState("");
   const [seedPhrase, setSeedPhrase] = useState("");
+  const [custodyPrivateKey, setCustodyPrivateKey] = useState("");
+  const [secretKind, setSecretKind] = useState<SecretKind>("none");
   const [custodyAddress, setCustodyAddress] = useState("");
   const [recoveryAddressInput, setRecoveryAddressInput] = useState("");
   const [profileDisplayName, setProfileDisplayName] = useState("");
@@ -78,7 +154,10 @@ export default function Home() {
   const [priceWei, setPriceWei] = useState<bigint | null>(null);
   const [custodyBalanceWei, setCustodyBalanceWei] = useState<bigint | null>(null);
   const [fid, setFid] = useState<bigint | null>(null);
+  const [onchainCustodyAddress, setOnchainCustodyAddress] = useState("");
+  const [onchainRecoveryAddress, setOnchainRecoveryAddress] = useState("");
   const [registrationTxHash, setRegistrationTxHash] = useState("");
+  const [recoveryUpdateTxHash, setRecoveryUpdateTxHash] = useState("");
   const [qrCodeDataUrl, setQrCodeDataUrl] = useState("");
   const [seedVisible, setSeedVisible] = useState(false);
   const [backedUp, setBackedUp] = useState(false);
@@ -92,6 +171,7 @@ export default function Home() {
   const profilePromptShownRef = useRef(false);
 
   const words = seedPhrase ? seedPhrase.split(" ") : [];
+  const hasCustodySecret = custodyPrivateKey.length > 0;
 
   const resolvedRecoveryAddress = useMemo(() => {
     const fromInput = recoveryAddressInput.trim();
@@ -130,8 +210,7 @@ export default function Home() {
   const isFunded = priceWei !== null && custodyBalanceWei !== null && custodyBalanceWei >= priceWei;
   const fundingShortfallWei =
     priceWei !== null && custodyBalanceWei !== null && custodyBalanceWei < priceWei ? priceWei - custodyBalanceWei : ZERO;
-  const canAttemptRegistration =
-    seedPhrase.length > 0 && custodyAddress.length > 0 && ethers.isAddress(resolvedRecoveryAddress);
+  const canAttemptRegistration = hasCustodySecret && custodyAddress.length > 0 && ethers.isAddress(resolvedRecoveryAddress);
   const profileAvatarHttpUrl = useMemo(() => toHttpUrl(profileAvatarUrl), [profileAvatarUrl]);
   const hasProfileDraft = profileDisplayName.trim().length > 0 || profileAvatarUrl.trim().length > 0;
 
@@ -166,7 +245,21 @@ export default function Home() {
       const currentBalance = await provider.getBalance(targetAddress);
       setCustodyBalanceWei(currentBalance);
       const maybeFid = (await idRegistry.idOf(targetAddress)) as bigint;
-      setFid(maybeFid === ZERO ? null : maybeFid);
+      if (maybeFid === ZERO) {
+        setFid(null);
+        setOnchainCustodyAddress("");
+        setOnchainRecoveryAddress("");
+        return;
+      }
+
+      const [onchainCustody, onchainRecovery] = (await Promise.all([
+        idRegistry.custodyOf(maybeFid),
+        idRegistry.recoveryOf(maybeFid),
+      ])) as [string, string];
+
+      setFid(maybeFid);
+      setOnchainCustodyAddress(onchainCustody);
+      setOnchainRecoveryAddress(onchainRecovery);
     }
   }, [rpcUrl]);
 
@@ -177,7 +270,10 @@ export default function Home() {
       const phrase = wallet.mnemonic?.phrase;
       if (!phrase) throw new Error("Failed to generate a mnemonic phrase.");
 
+      setImportSecretInput("");
       setSeedPhrase(phrase);
+      setCustodyPrivateKey(wallet.privateKey);
+      setSecretKind("mnemonic");
       setCustodyAddress(wallet.address);
       setRecoveryAddressInput("");
       setProfileDisplayName("");
@@ -187,9 +283,12 @@ export default function Home() {
       setSeedVisible(false);
       setBackedUp(false);
       setRegistrationTxHash("");
+      setRecoveryUpdateTxHash("");
       setQrCodeDataUrl("");
       setCustodyBalanceWei(null);
       setFid(null);
+      setOnchainCustodyAddress("");
+      setOnchainRecoveryAddress("");
       pollErrorRef.current = "";
       autoRegisterLockRef.current = false;
       autoRegisterNextAttemptRef.current = 0;
@@ -206,6 +305,46 @@ export default function Home() {
       setBusyAction(null);
     }
   }, [pushActivity, readOnchainState]);
+
+  const handleImportSecret = useCallback(async () => {
+    setBusyAction("import");
+    try {
+      const parsed = parseCustodySecret(importSecretInput);
+      const wallet = new ethers.Wallet(parsed.privateKey);
+
+      setSeedPhrase(parsed.mnemonic);
+      setCustodyPrivateKey(parsed.privateKey);
+      setSecretKind(parsed.kind);
+      setCustodyAddress(wallet.address);
+      setRecoveryAddressInput("");
+      setSeedVisible(false);
+      setBackedUp(false);
+      setRegistrationTxHash("");
+      setRecoveryUpdateTxHash("");
+      setQrCodeDataUrl("");
+      setCustodyBalanceWei(null);
+      setFid(null);
+      setOnchainCustodyAddress("");
+      setOnchainRecoveryAddress("");
+      pollErrorRef.current = "";
+      autoRegisterLockRef.current = false;
+      autoRegisterNextAttemptRef.current = 0;
+      autoBackupWarningRef.current = false;
+      profilePromptShownRef.current = false;
+
+      pushActivity(
+        `Imported ${parsed.kind === "mnemonic" ? "seed phrase" : "private key"} for custody ${shortAddress(wallet.address)}.`,
+        "success",
+      );
+
+      await readOnchainState(wallet.address);
+      pushActivity("Loaded Farcaster account data for imported key.", "info");
+    } catch (error) {
+      pushActivity(`Import failed: ${formatError(error)}`, "error");
+    } finally {
+      setBusyAction(null);
+    }
+  }, [importSecretInput, pushActivity, readOnchainState]);
 
   const handleCopyPhrase = useCallback(async () => {
     if (!seedPhrase) return;
@@ -302,7 +441,7 @@ export default function Home() {
   const handleRegister = useCallback(async (source: "manual" | "auto" = "manual") => {
     setBusyAction("register");
     try {
-      if (!seedPhrase || !custodyAddress) throw new Error("Generate a seed phrase first.");
+      if (!custodyPrivateKey || !custodyAddress) throw new Error("Generate or import a custody key first.");
 
       const recoveryAddress = resolvedRecoveryAddress.trim();
       if (!ethers.isAddress(recoveryAddress)) throw new Error("Recovery address is invalid.");
@@ -314,9 +453,9 @@ export default function Home() {
         throw new Error(`RPC is on chainId ${network.chainId.toString()}. Use Optimism Mainnet (chainId 10).`);
       }
 
-      const custodyWallet = ethers.HDNodeWallet.fromPhrase(seedPhrase).connect(provider);
+      const custodyWallet = new ethers.Wallet(custodyPrivateKey, provider);
       if (custodyWallet.address.toLowerCase() !== custodyAddress.toLowerCase()) {
-        throw new Error("Seed phrase does not match the displayed custody address.");
+        throw new Error("Custody key does not match the displayed custody address.");
       }
 
       const idGateway = new ethers.Contract(ID_GATEWAY_ADDRESS, idGatewayAbi, custodyWallet);
@@ -357,7 +496,48 @@ export default function Home() {
     } finally {
       setBusyAction(null);
     }
-  }, [seedPhrase, custodyAddress, resolvedRecoveryAddress, rpcUrl, pushActivity]);
+  }, [custodyPrivateKey, custodyAddress, resolvedRecoveryAddress, rpcUrl, pushActivity]);
+
+  const handleSetRecoverySigner = useCallback(async () => {
+    setBusyAction("setRecovery");
+    try {
+      if (!custodyPrivateKey || !custodyAddress) throw new Error("Generate or import a custody key first.");
+      if (!fid) throw new Error("No FID loaded for this custody key.");
+
+      const recoveryAddress = resolvedRecoveryAddress.trim();
+      if (!ethers.isAddress(recoveryAddress)) throw new Error("Recovery address is invalid.");
+
+      const rpc = rpcUrl.trim() || DEFAULT_OP_RPC;
+      const provider = new ethers.JsonRpcProvider(rpc);
+      const network = await provider.getNetwork();
+      if (network.chainId !== OP_CHAIN_ID) {
+        throw new Error(`RPC is on chainId ${network.chainId.toString()}. Use Optimism Mainnet (chainId 10).`);
+      }
+
+      const custodyWallet = new ethers.Wallet(custodyPrivateKey, provider);
+      if (custodyWallet.address.toLowerCase() !== custodyAddress.toLowerCase()) {
+        throw new Error("Custody key does not match the displayed custody address.");
+      }
+
+      const idGateway = new ethers.Contract(ID_GATEWAY_ADDRESS, idGatewayAbi, custodyWallet);
+      const idRegistryAddress = (await idGateway.idRegistry()) as string;
+      const idRegistry = new ethers.Contract(idRegistryAddress, idRegistryAbi, custodyWallet);
+
+      const tx = await idRegistry.changeRecoveryAddress(recoveryAddress);
+      setRecoveryUpdateTxHash(tx.hash);
+      pushActivity(`Set recovery signer tx submitted: ${tx.hash}`, "info");
+      const receipt = await tx.wait(2);
+
+      if (!receipt || receipt.status !== 1) throw new Error("Recovery signer update transaction failed.");
+
+      await readOnchainState(custodyAddress);
+      pushActivity(`Recovery signer updated to ${shortAddress(recoveryAddress)}.`, "success");
+    } catch (error) {
+      pushActivity(`Set recovery signer failed: ${formatError(error)}`, "error");
+    } finally {
+      setBusyAction(null);
+    }
+  }, [custodyPrivateKey, custodyAddress, fid, resolvedRecoveryAddress, rpcUrl, readOnchainState, pushActivity]);
 
   useEffect(() => {
     if (!fundingUri) {
@@ -456,6 +636,50 @@ export default function Home() {
       </section>
 
       <section className="grid">
+        <article className="panel card span2">
+          <h2>0) Import existing key + lookup account</h2>
+          <p className="muted">
+            Paste a seed phrase, private key, or backup JSON. We will derive custody address and load Farcaster account data
+            (FID, onchain custody, recovery signer).
+          </p>
+          <div className="stack">
+            <label>
+              Seed phrase / private key / backup JSON
+              <textarea
+                value={importSecretInput}
+                onChange={(event) => setImportSecretInput(event.target.value)}
+                placeholder="word1 word2 ... OR 0xabc... OR { &quot;seedPhrase&quot;: &quot;...&quot; }"
+              />
+            </label>
+            <div className="actions">
+              <button type="button" className="btn primary" disabled={!importSecretInput.trim() || isBusy} onClick={handleImportSecret}>
+                Import key
+              </button>
+              <button type="button" className="btn" disabled={!custodyAddress || isBusy} onClick={handleRefreshQuote}>
+                Refresh account info
+              </button>
+            </div>
+          </div>
+          <dl className="facts">
+            <div>
+              <dt>Loaded key type</dt>
+              <dd>{secretKind === "none" ? "-" : secretKind}</dd>
+            </div>
+            <div>
+              <dt>Loaded custody</dt>
+              <dd>{custodyAddress ? <code>{custodyAddress}</code> : "-"}</dd>
+            </div>
+            <div>
+              <dt>Loaded FID</dt>
+              <dd>{fid ? fid.toString() : "No FID found for key"}</dd>
+            </div>
+            <div>
+              <dt>Onchain recovery signer</dt>
+              <dd>{onchainRecoveryAddress ? <code>{onchainRecoveryAddress}</code> : "-"}</dd>
+            </div>
+          </dl>
+        </article>
+
         <article className="panel card">
           <h2>1) Generate seed phrase</h2>
           <p className="muted">
@@ -602,7 +826,8 @@ export default function Home() {
         <article className="panel card span2">
           <h2>3) Recovery + registration</h2>
           <p className="muted">
-            Registration is signed by the generated seed phrase wallet and sent directly to IdGateway on Optimism.
+            Registration is signed by the loaded custody key and sent to IdGateway. You can also update the onchain recovery
+            signer for an existing FID.
           </p>
           <div className="stack">
             <label>
@@ -631,6 +856,14 @@ export default function Home() {
             >
               Try register now
             </button>
+            <button
+              type="button"
+              className="btn"
+              disabled={!hasCustodySecret || !fid || !ethers.isAddress(resolvedRecoveryAddress) || isBusy}
+              onClick={handleSetRecoverySigner}
+            >
+              Set recovery signer onchain
+            </button>
           </div>
           {!backedUp ? (
             <div className="note">
@@ -658,10 +891,28 @@ export default function Home() {
               <code>{resolvedRecoveryAddress || "-"}</code>
             </div>
             <div>
+              <span>Onchain recovery</span>
+              <code>{onchainRecoveryAddress || "-"}</code>
+            </div>
+            <div>
+              <span>Onchain custody</span>
+              <code>{onchainCustodyAddress || "-"}</code>
+            </div>
+            <div>
               <span>Register tx</span>
               {registrationTxHash ? (
                 <a href={`${OP_EXPLORER}/tx/${registrationTxHash}`} target="_blank" rel="noreferrer">
                   {shortAddress(registrationTxHash)}
+                </a>
+              ) : (
+                <strong>-</strong>
+              )}
+            </div>
+            <div>
+              <span>Set recovery tx</span>
+              {recoveryUpdateTxHash ? (
+                <a href={`${OP_EXPLORER}/tx/${recoveryUpdateTxHash}`} target="_blank" rel="noreferrer">
+                  {shortAddress(recoveryUpdateTxHash)}
                 </a>
               ) : (
                 <strong>-</strong>
