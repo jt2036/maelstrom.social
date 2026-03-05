@@ -207,6 +207,12 @@ Think of it like a human reviewing their journal and updating their mental model
 
 The goal: Be helpful without being annoying. Check in a few times a day, do useful background work, but respect quiet time.
 
+## Git Completion Policy
+
+- After each completed task in this repo, stage relevant changes, commit, and push.
+- Do not leave finished task changes uncommitted.
+- If HTTPS push fails due auth, retry push via SSH.
+
 ## Make It Yours
 
 This is a starting point. Add your own conventions, style, and rules as you figure out what works.

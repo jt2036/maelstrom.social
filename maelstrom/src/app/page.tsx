@@ -14,6 +14,7 @@ const AUTO_REGISTER_RETRY_MS = 30000;
 const REGISTRATION_BUFFER_WEI = ethers.parseEther("0.0002");
 
 const ID_GATEWAY_ADDRESS = "0x00000000fc25870c6ed6b6c7e41fb078b7656f69";
+const FARCASTER_STANDARD_RECOVERY_ADDRESS = "0x00000000fcb080a4d6c39a9354da9eb9bc104cd7";
 
 const idGatewayAbi = [
   "function idRegistry() view returns (address)",
@@ -145,7 +146,7 @@ export default function Home() {
   const [custodyPrivateKey, setCustodyPrivateKey] = useState("");
   const [secretKind, setSecretKind] = useState<SecretKind>("none");
   const [custodyAddress, setCustodyAddress] = useState("");
-  const [recoveryAddressInput, setRecoveryAddressInput] = useState("");
+  const [recoveryAddressInput, setRecoveryAddressInput] = useState(FARCASTER_STANDARD_RECOVERY_ADDRESS);
   const [profileDisplayName, setProfileDisplayName] = useState("");
   const [profileAvatarUrl, setProfileAvatarUrl] = useState("");
   const [rpcUrl, setRpcUrl] = useState(DEFAULT_OP_RPC);
@@ -176,8 +177,14 @@ export default function Home() {
   const resolvedRecoveryAddress = useMemo(() => {
     const fromInput = recoveryAddressInput.trim();
     if (fromInput) return fromInput;
-    return custodyAddress;
-  }, [recoveryAddressInput, custodyAddress]);
+    return FARCASTER_STANDARD_RECOVERY_ADDRESS;
+  }, [recoveryAddressInput]);
+  const usingStandardRecovery =
+    ethers.isAddress(resolvedRecoveryAddress) &&
+    resolvedRecoveryAddress.toLowerCase() === FARCASTER_STANDARD_RECOVERY_ADDRESS.toLowerCase();
+  const onchainUsesStandardRecovery =
+    onchainRecoveryAddress.length > 0 &&
+    onchainRecoveryAddress.toLowerCase() === FARCASTER_STANDARD_RECOVERY_ADDRESS.toLowerCase();
 
   const suggestedFundingWei = useMemo(() => {
     if (priceWei === null) return null;
@@ -275,7 +282,7 @@ export default function Home() {
       setCustodyPrivateKey(wallet.privateKey);
       setSecretKind("mnemonic");
       setCustodyAddress(wallet.address);
-      setRecoveryAddressInput("");
+      setRecoveryAddressInput(FARCASTER_STANDARD_RECOVERY_ADDRESS);
       setProfileDisplayName("");
       setProfileAvatarUrl("");
       setRequestedFundingEth("");
@@ -316,7 +323,7 @@ export default function Home() {
       setCustodyPrivateKey(parsed.privateKey);
       setSecretKind(parsed.kind);
       setCustodyAddress(wallet.address);
-      setRecoveryAddressInput("");
+      setRecoveryAddressInput(FARCASTER_STANDARD_RECOVERY_ADDRESS);
       setSeedVisible(false);
       setBackedUp(false);
       setRegistrationTxHash("");
@@ -677,6 +684,12 @@ export default function Home() {
               <dt>Onchain recovery signer</dt>
               <dd>{onchainRecoveryAddress ? <code>{onchainRecoveryAddress}</code> : "-"}</dd>
             </div>
+            <div>
+              <dt>Standard recovery proxy</dt>
+              <dd>
+                <code>{FARCASTER_STANDARD_RECOVERY_ADDRESS}</code>
+              </dd>
+            </div>
           </dl>
         </article>
 
@@ -831,11 +844,11 @@ export default function Home() {
           </p>
           <div className="stack">
             <label>
-              Recovery address (optional)
+              Recovery address (recommended: standard Farcaster recovery proxy)
               <input
                 value={recoveryAddressInput}
                 onChange={(event) => setRecoveryAddressInput(event.target.value)}
-                placeholder={custodyAddress || "0x..."}
+                placeholder={FARCASTER_STANDARD_RECOVERY_ADDRESS}
               />
             </label>
           </div>
@@ -864,6 +877,14 @@ export default function Home() {
             >
               Set recovery signer onchain
             </button>
+            <button
+              type="button"
+              className="btn"
+              disabled={isBusy}
+              onClick={() => setRecoveryAddressInput(FARCASTER_STANDARD_RECOVERY_ADDRESS)}
+            >
+              Use standard Farcaster recovery
+            </button>
           </div>
           {!backedUp ? (
             <div className="note">
@@ -891,8 +912,16 @@ export default function Home() {
               <code>{resolvedRecoveryAddress || "-"}</code>
             </div>
             <div>
+              <span>Recovery mode</span>
+              <strong>{usingStandardRecovery ? "Standard (Warpcast-style)" : "Custom"}</strong>
+            </div>
+            <div>
               <span>Onchain recovery</span>
               <code>{onchainRecoveryAddress || "-"}</code>
+            </div>
+            <div>
+              <span>Onchain mode</span>
+              <strong>{onchainRecoveryAddress ? (onchainUsesStandardRecovery ? "Standard" : "Custom") : "-"}</strong>
             </div>
             <div>
               <span>Onchain custody</span>
