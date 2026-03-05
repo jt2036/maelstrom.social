@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "build:pages": "STATIC_EXPORT=1 next build",
     "start": "next start",
     "lint": "next lint",
     "type-check": "tsc --noEmit"
